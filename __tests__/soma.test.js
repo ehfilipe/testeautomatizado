@@ -13,3 +13,13 @@ describe('soma', () => {
     expect(soma(5, -3)).toBe(2);
   });
 });
+test('soma números negativos', () => {
+  expect(soma(-2, -3)).toBe(-5);
+});
+
+test('soma zero com número', () => {
+  expect(soma(0, 5)).toBe(5);
+});
+test('soma números decimais', () => {
+  expect(soma(1.5, 2.5)).toBe(4);
+});
