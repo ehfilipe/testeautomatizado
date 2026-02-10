@@ -1,63 +1,58 @@
 /**
- * AI Code Review Bot (GitHub Actions)
+ * AI Code Review Bot (GitHub Actions) — Tradio
  * Arquitetura profissional:
  * - Lê diff do PR via GitHub API
  * - Envia para OpenAI (GPT-4.1)
  * - Publica comentário no Pull Request
  *
- * Exporta uma função main({ github, context, core }) para ser chamada pelo actions/github-script.
+ * Melhorias aplicadas:
+ * 1) Reuso da função truncate() para truncar patch por arquivo e diff total
+ * 2) Aviso explícito no comentário quando houver truncamento (arquivos/patch/diff total)
  */
 
-// =======================
-// fetch (compatibilidade)
-// =======================
-async function getFetch() {
-  // Node 18+ normalmente já tem fetch global (no seu workflow é Node 20).
-  if (typeof global.fetch === "function") return global.fetch;
-
-  // Fallback: tenta node-fetch (se estiver instalado)
+// Fetch compatível (Node >=18 tem fetch global; fallback tenta node-fetch)
+let fetchFn = global.fetch;
+if (!fetchFn) {
   try {
-    // node-fetch v3 é ESM; por isso usamos import dinâmico
-    const mod = await import("node-fetch");
-    return mod.default;
+    // eslint-disable-next-line global-require
+    fetchFn = require("node-fetch");
   } catch (e) {
-    throw new Error(
-      "fetch não está disponível neste ambiente. " +
-        "Seu workflow deve usar Node >= 18 (ex: node-version: 20). " +
-        "Alternativamente, instale 'node-fetch' e permita o import dinâmico."
-    );
+    // Se não tiver node-fetch, o script vai falhar ao tentar chamar API
+    fetchFn = null;
   }
 }
 
 // =======================
 // Utilidades
 // =======================
+
 function requiredEnv(name, value) {
   if (!value) throw new Error(`Missing required env: ${name}`);
 }
 
 function ensureRepoContext(context) {
-  if (
-    !context ||
-    !context.repo ||
-    !context.repo.owner ||
-    !context.repo.repo
-  ) {
-    throw new Error("context.repo está indefinido (owner/repo não encontrados).");
+  if (!context?.repo?.owner || !context?.repo?.repo) {
+    throw new Error("context.repo está indefinido (owner/repo).");
   }
 }
 
-function truncate(text, max = 12000) {
+function truncate(text, max) {
   if (!text) return "";
   if (text.length <= max) return text;
-  return text.slice(0, max) + "\n\n... (diff truncado)";
+  return text.slice(0, max) + "\n\n... (truncado)";
 }
 
 // =======================
 // OpenAI
 // =======================
+
 async function callOpenAI({ apiKey, diffText }) {
   requiredEnv("OPENAI_API_KEY", apiKey);
+  if (!fetchFn) {
+    throw new Error(
+      "fetch não disponível neste runner. Instale 'node-fetch' ou use Node >= 18."
+    );
+  }
 
   const prompt = `
 Você é um revisor sênior de código.
@@ -65,8 +60,8 @@ Você é um revisor sênior de código.
 Regras:
 - Seja objetivo
 - Organize em tópicos
-- Aponte: bugs prováveis, edge cases, melhorias de qualidade, segurança, performance e legibilidade
-- Se possível, sugira trechos de código corrigidos
+- Aponte bugs, edge cases, segurança, performance e legibilidade
+- Se possível, sugira código corrigido
 - Se não houver problemas relevantes, diga que está OK
 
 Diff do Pull Request (pode estar truncado):
@@ -74,9 +69,7 @@ Diff do Pull Request (pode estar truncado):
 ${diffText}
 `.trim();
 
-  const fetch = await getFetch();
-
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+  const response = await fetchFn("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -86,7 +79,7 @@ ${diffText}
       model: "gpt-4.1",
       temperature: 0.2,
       messages: [
-        { role: "system", content: "Você é um revisor de código experiente e criterioso." },
+        { role: "system", content: "Você é um revisor de código experiente." },
         { role: "user", content: prompt },
       ],
     }),
@@ -98,69 +91,95 @@ ${diffText}
   }
 
   const data = await response.json();
-  return data?.choices?.[0]?.message?.content?.trim() || "Não foi possível gerar a revisão.";
+  return (
+    data?.choices?.[0]?.message?.content?.trim() ||
+    "Não foi possível gerar a revisão."
+  );
 }
 
 // =======================
-// GitHub (Diff do PR)
+// GitHub
 // =======================
-async function getPullRequestDiff({ github, context, core }) {
-  const pr = context?.payload?.pull_request;
 
+async function getPullRequestDiff({ github, context, core }) {
+  const pr = context.payload.pull_request;
   if (!pr) {
     core?.info?.("No pull request context. Skipping.");
-    return null;
+    return { diffText: null, meta: null };
   }
 
-  // Se quiser ignorar PR em draft
   if (pr.draft) {
     core?.info?.("PR is draft. Skipping review.");
-    return null;
+    return { diffText: null, meta: { skippedDraft: true } };
   }
 
   ensureRepoContext(context);
 
-  const owner = context.repo.owner;
-  const repo = context.repo.repo;
-
   const files = await github.paginate(github.rest.pulls.listFiles, {
-    owner,
-    repo,
+    owner: context.repo.owner,
+    repo: context.repo.repo,
     pull_number: pr.number,
     per_page: 100,
   });
 
-  // Limites para evitar payload enorme
+  // Limites (produção-friendly)
   const maxFiles = 15;
   const maxPatchCharsPerFile = 5000;
+  const maxTotalChars = 12000;
 
-  const selected = files
-    .filter((f) => f.patch) // ignora binários/grandes sem patch
-    .slice(0, maxFiles);
+  const filesWithPatch = files.filter((f) => f.patch);
 
-  if (selected.length === 0) return null;
+  const selected = filesWithPatch.slice(0, maxFiles);
 
-  const patches = selected
-    .map((f) => {
-      const patch =
-        f.patch.length > maxPatchCharsPerFile
-          ? f.patch.slice(0, maxPatchCharsPerFile) + "\n... (patch truncado)\n"
-          : f.patch;
+  if (selected.length === 0) {
+    core?.info?.("No text patches found to review.");
+    return { diffText: null, meta: { noPatches: true } };
+  }
 
-      return `FILE: ${f.filename}\nSTATUS: ${f.status}\nPATCH:\n${patch}\n`;
-    })
-    .join("\n---\n");
+  // Flags de truncamento
+  const truncated = {
+    filesLimited: filesWithPatch.length > maxFiles,
+    patchTruncatedCount: 0,
+    totalTruncated: false,
+    maxFiles,
+    maxPatchCharsPerFile,
+    maxTotalChars,
+    filesWithPatchCount: filesWithPatch.length,
+    selectedCount: selected.length,
+  };
 
-  if (!patches.trim()) return null;
+  const chunks = selected.map((f) => {
+    const originalLen = f.patch.length;
+    const patch = truncate(f.patch, maxPatchCharsPerFile);
+    if (originalLen > maxPatchCharsPerFile) truncated.patchTruncatedCount += 1;
 
-  return truncate(patches, 12000);
+    return `FILE: ${f.filename}
+STATUS: ${f.status}
+PATCH:
+${patch}
+`;
+  });
+
+  let diffText = chunks.join("\n---\n").trim();
+
+  // Se limitou arquivos, avisa dentro do próprio diff enviado ao modelo também
+  if (truncated.filesLimited) {
+    diffText += `\n\n... (apenas os primeiros ${maxFiles} arquivos com patch foram incluídos; total com patch: ${filesWithPatch.length})`;
+  }
+
+  // Trunca o diff total (segurança de payload)
+  const beforeTotalLen = diffText.length;
+  diffText = truncate(diffText, maxTotalChars);
+  if (beforeTotalLen > maxTotalChars) truncated.totalTruncated = true;
+
+  return { diffText, meta: truncated };
 }
 
 async function postComment({ github, context, body }) {
-  const pr = context?.payload?.pull_request;
-  if (!pr) return;
-
   ensureRepoContext(context);
+
+  const pr = context.payload.pull_request;
+  if (!pr) throw new Error("No pull request context to comment on.");
 
   await github.rest.issues.createComment({
     owner: context.repo.owner,
@@ -171,13 +190,12 @@ async function postComment({ github, context, body }) {
 }
 
 // =======================
-// Main (export)
+// Main (exportado para actions/github-script)
 // =======================
+
 async function main({ github, context, core }) {
   try {
-    ensureRepoContext(context);
-
-    const diffText = await getPullRequestDiff({ github, context, core });
+    const { diffText, meta } = await getPullRequestDiff({ github, context, core });
 
     if (!diffText) {
       core.info("No diff found to review.");
@@ -189,15 +207,35 @@ async function main({ github, context, core }) {
       diffText,
     });
 
-    const truncatedNote = diffText.includes("... (diff truncado)")
-      ? `\n\n⚠️ O diff analisado foi truncado (máx. 12000 caracteres).`
-      : "";
+    // Nota de truncamento no comentário (melhoria #2)
+    let truncationNote = "";
+    if (meta) {
+      const notes = [];
+      if (meta.filesLimited) {
+        notes.push(
+          `- Foram analisados apenas os primeiros **${meta.maxFiles}** arquivos com patch (total com patch: **${meta.filesWithPatchCount}**).`
+        );
+      }
+      if (meta.patchTruncatedCount > 0) {
+        notes.push(
+          `- **${meta.patchTruncatedCount}** patch(es) foram truncados para **${meta.maxPatchCharsPerFile}** caracteres.`
+        );
+      }
+      if (meta.totalTruncated) {
+        notes.push(
+          `- O diff total foi truncado para **${meta.maxTotalChars}** caracteres.`
+        );
+      }
+
+      if (notes.length) {
+        truncationNote = `\n\n⚠️ **Aviso de truncamento**\n${notes.join("\n")}\n`;
+      }
+    }
 
     const comment = `## 🤖 AI Code TRADIO Review
 
 ${review}
-${truncatedNote}
-
+${truncationNote}
 ---
 
 _Obs: revisão automática baseada no diff do PR (pode estar truncado)._`;
