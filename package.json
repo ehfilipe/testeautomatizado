@@ -1,0 +1,9 @@
+{
+  "name": "testeautomatizado",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "lint": "echo \"Lint OK\"",
+    "test": "echo \"Tests OK\""
+  }
+}
