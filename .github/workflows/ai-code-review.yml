@@ -97,7 +97,7 @@ jobs:
                 "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
               },
               body: JSON.stringify({
-                model: "gpt-4.1-mini",
+                model: "gpt-4.1",
                 messages: [
                   { role: "system", content: "Você é um revisor de código muito criterioso e útil." },
                   { role: "user", content: prompt }
@@ -116,7 +116,7 @@ jobs:
             const review = data?.choices?.[0]?.message?.content?.trim() || "Sem resposta do modelo.";
 
             // 5) Publica comentário no PR
-            const body = `## 🤖 AI Code Review\n\n${review}\n\n---\n_Obs: revisão automática baseada no diff do PR (pode estar truncado)._`;
+            const body = `## 🤖 AI Code TRADIO Review\n\n${review}\n\n---\n_Obs: revisão automática baseada no diff do PR (pode estar truncado)._`;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
